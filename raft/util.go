@@ -34,6 +34,12 @@ type IntSet struct {
 	values map[int]bool
 }
 
+func NewIntSet() *IntSet {
+	return &IntSet{
+		values: make(map[int]bool),
+	}
+}
+
 func (s *IntSet) Containes(key int) bool {
 	_, ok := s.values[key]
 	return ok

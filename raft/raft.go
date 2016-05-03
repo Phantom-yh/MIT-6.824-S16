@@ -186,7 +186,7 @@ func (rf *Raft) runAsLeader() {
 	for {
 		select {
 		case <-heartBeat:
-			go rf.sendHeartBeats()
+			go rf.sendHeartBeats() // TODO do we need to run go routine every time ?
 
 		case s := <-rf.stateTranCh:
 			switch s {
@@ -274,7 +274,7 @@ func (rf *Raft) sendHeartBeats() {
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
 			go func(id int) {
-				ok, reply := rf.sendHeartBeat(id)
+				ok, reply := rf.sendHeartBeat(id) // TODO it may take a while to return, even after next sendHeartBeat()
 				if !ok {
 					rf.logln(fmt.Sprintf("failed to send heart beat to peer %v", id))
 				} else if !reply.Success {
@@ -290,11 +290,9 @@ func (rf *Raft) sendHeartBeats() {
 	}
 }
 
+// TODO should add timeout to rpc Call
 func (rf *Raft) sendHeartBeat(peerId int) (bool, *AppendEntriesReply) {
-	args := &AppendEntriesArgs{}
-	args.Term = rf.term
-	args.LeaderId = rf.me
-
+	args := rf.makeHeartbeat()
 	var reply AppendEntriesReply
 
 	if ok := rf.peers[peerId].Call("Raft.AppendEntries", *args, &reply); !ok {
@@ -303,6 +301,14 @@ func (rf *Raft) sendHeartBeat(peerId int) (bool, *AppendEntriesReply) {
 	} else {
 		return true, &reply
 	}
+}
+
+func (rf *Raft) makeHeartbeat() *AppendEntriesArgs {
+	args := &AppendEntriesArgs{}
+	args.Term = rf.term
+	args.LeaderId = rf.me
+	args.LeaderCommit = rf.commitIndex
+	return args
 }
 
 // TODO put this to leader's scope
@@ -325,19 +331,15 @@ func (rf *Raft) startAgents() {
 func (rf *Raft) startAgent(i int) {
 	agent := rf.agents[i]
 
-	replicate := func() {
+	replicate := func(idx int) {
 		rf.logln(fmt.Sprintf("replicating log entry %v to server %v", agent.nextIndex, i))
-		go rf.replicate(i, agent.nextIndex)
+		go rf.replicate(i, idx)
 	}
 
 	for {
 		select {
 		case idx := <-agent.entryChan:
-			if idx == agent.nextIndex {
-				replicate()
-			} else {
-				rf.logln("postpone replicating entry ", idx)
-			}
+			replicate(idx)
 
 		case lastSuccess := <-agent.successChan:
 			rf.logln(fmt.Sprintf("logs pre to %v have been succesfully replicated on server %v", lastSuccess, i))
@@ -347,13 +349,13 @@ func (rf *Raft) startAgent(i int) {
 
 			// continue to replicate postponed entries if any
 			if agent.nextIndex <= rf.log.GetLastIndex() { // still fall behind
-				replicate()
+				replicate(agent.nextIndex)
 			}
 
 		case firstFailure := <-agent.failureChan:
 			rf.logln(fmt.Sprintf("log after %v failed to replicate on machine %v", firstFailure, i))
 			agent.nextIndex--
-			replicate()
+			replicate(agent.nextIndex)
 
 		case <-agent.stop:
 			rf.logln("stop agent ", i)
@@ -364,6 +366,10 @@ func (rf *Raft) startAgent(i int) {
 
 // TODO can be optimized to send multiple entries each RPC call
 func (rf *Raft) replicate(agentId, logIdx int) {
+	set := NewIntSet()
+	set.Add(rf.me)
+	rf.replicated[logIdx] = set
+
 	for {
 		ok, reply := rf.sendAppendEntries(agentId, logIdx, logIdx)
 		if ok {
@@ -376,6 +382,7 @@ func (rf *Raft) replicate(agentId, logIdx int) {
 			break
 		} else {
 			rf.logln(fmt.Sprintf("failed to make AppendEntries call to server %v, retrying", agentId))
+			// TODO may sleep for some time before retrying
 		}
 	}
 }
@@ -407,12 +414,12 @@ func (rf *Raft) sendAppendEntries(peerId, from, to int) (bool, *AppendEntriesRep
 }
 
 func (rf *Raft) updateLogRep(r *logRep) {
-	rf.logln("start updating log entry")
+	rf.logln(fmt.Sprintf("updating log entry : peer = %v, log index = %v", r.peerId, r.logIdx))
 
 	if set, ok := rf.replicated[r.logIdx]; ok {
 		set.Add(r.peerId)
 		if set.Size() >= rf.majority() {
-			rf.logln(fmt.Sprintf("log %v has been replicated to majority peers, start to apply it to leader's local state machine"))
+			rf.logln(fmt.Sprintf("log %v has been replicated to majority peers, start to apply it to leader's local state machine", r.logIdx))
 
 			if r.logIdx > rf.commitIndex {
 				entry := rf.log.Get(r.logIdx)
@@ -550,8 +557,11 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 		reply.Success = true
 		rf.leaderId = args.LeaderId
 		rf.heartbeatCh <- true
+		rf.updateAndApply(&args) // heartbeat can also be used to update and apply uncommitted entries on followers
 		return
 	}
+
+	rf.logln(fmt.Sprintf("start to append %v entries", len(args.Entries)))
 
 	// consistency check before appending entries
 	e := &LogEntry{Term: args.PrevLogTerm}
@@ -564,6 +574,8 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 
 		// delete conflicting entry and all entries after it (as described in the original paper)
 		rf.log.DeleteAll(args.PrevLogIndex, rf.log.GetLastIndex())
+
+		rf.logln("failed for consisency check, prev log index = ", args.PrevLogIndex, "prev log term = ", args.PrevLogTerm)
 		return
 	}
 
@@ -571,6 +583,10 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	err := rf.log.WriteAll(args.PrevLogIndex+1, args.Entries)
 	reply.Success = err == nil
 
+	rf.updateAndApply(&args)
+}
+
+func (rf *Raft) updateAndApply(args *AppendEntriesArgs) {
 	// update commit index
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = Min(args.LeaderCommit, rf.log.GetLastIndex())
@@ -586,13 +602,14 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 func (rf *Raft) apply() {
 	for {
 		for rf.lastApplied < rf.commitIndex {
+			rf.lastApplied++
 			entry := rf.log.Get(rf.lastApplied)
 			msg := &ApplyMsg{
 				Index:   rf.lastApplied,
 				Command: entry.Command,
 			}
 			rf.applyCh <- *msg
-			rf.lastApplied++
+			rf.logln(fmt.Sprintf("applied log %v to local state machine", rf.lastApplied))
 		}
 
 		_, ok := <-rf.applyEventCh
