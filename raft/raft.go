@@ -17,12 +17,12 @@ package raft
 //   in the same server.
 //
 
-import "sync"
 import (
 	"fmt"
 	"labrpc"
 	"log"
 	"math/rand"
+	"sync"
 	"time"
 )
 
@@ -53,28 +53,21 @@ type Raft struct {
 	// Your data here.
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	state                                   State //  current state. leader,follower, candidate
-	electionTimeoutLow, electionTimeoutHigh int   // range for init a election term, milliseconds
-	term                                    int   // current term, Persistent
-	heartBeatPeriod                         int   // milliseconds for sending heatBeat to all peers
-	leaderId                                int   // leader's index into peers[]
+	// parameters
+	electionTimeoutLow, electionTimeoutHigh int // range for init a election term, milliseconds
+	heartBeatPeriod                         int // milliseconds for sending heatBeat to all peers
+	retry                                   int // retry for RequestVote and AppendEntries
 
-	// candidate, leader
-	stalenessChan chan bool // detect stale term -> back to follower
+	// global
+	state State //  current state. leader,follower, candidate
+	term  int   // current term, Persistent
 
-	// follower, candidate
-	votedTerms    map[int]int // Persistent. term -> voted id. vote for at most one server in any given term. Equals to VotedFor in the original paper
-	heartBeatChan chan bool
-
-	// candidate
-	votes             Votes
-	voteChan          chan *Vote
-	leaderElectedChan chan bool // others become leader -> back to follower
-
-	// control
-	stateTranChan chan State // chan for new state
-	quit          chan bool
-	retry         int // retry for RequestVote and AppendEntries
+	// leader election
+	leaderId    int         // leader's index into peers[]
+	votedTerms  map[int]int // Persistent. term -> voted id. vote for at most one server in any given term. Equals to VotedFor in the original paper
+	votes       Votes       // votes received so far
+	heartbeatCh chan bool
+	stateTranCh chan State // chan for new state
 
 	// log replication
 	ml           sync.Mutex
@@ -86,7 +79,21 @@ type Raft struct {
 	replicated   map[int]*IntSet // result from peers for log replicated command
 	applyCh      chan ApplyMsg
 	applyEventCh chan bool
+
+	// control
+	quit chan bool
 }
+
+type Vote int
+type Votes []*Vote // indexes of voted peers
+
+type State int8
+
+const (
+	FOLLOWER  = State(0)
+	CANDIDATE = State(1)
+	LEADER    = State(2)
+)
 
 // a log has been successfully replicated
 type logRep struct {
@@ -104,135 +111,198 @@ type Agent struct {
 	stop        chan bool
 }
 
-type LogEntry struct {
-	Term    int
-	Command interface{}
-}
+func (rf *Raft) runAsFollower() {
+	timeout := make(chan bool)
+	clearTimeout := make(chan bool)
+	go rf.startFollowerElectionTimer(timeout, clearTimeout)
 
-type LogStore interface {
-	Append(*LogEntry) error
-	AppendAll([]*LogEntry) error
-	Write(idx int, e *LogEntry) error // write to idx
-	WriteAll(idx int, es []*LogEntry) error
-	Delete(idx int) error
-	DeleteAll(idxFrom, idxTo int) error
-	GetLastIndex() int // log index starts from 1
-	Len() int
-	Get(idx int) *LogEntry
-	GetAll(idxFrom, idxTo int) []*LogEntry
-	IsMatch(idx int, e *LogEntry) bool // if real entry matches the given entry
-}
+	for {
+		select {
+		case <-rf.heartbeatCh:
+			// receive heartBeat from leader normally. clear term timeout
+			clearTimeout <- true
 
-// for test purpose only
-type InMemLogStore struct {
-	entries []*LogEntry
-}
+		case s := <-rf.stateTranCh:
+			switch s {
+			case CANDIDATE:
+				rf.becomeCandidate()
+				return
+			}
 
-func NewInMemLogStore() LogStore {
-	return &InMemLogStore{make([]*LogEntry, 0)}
-}
-
-func (s *InMemLogStore) Append(e *LogEntry) error {
-	s.entries = append(s.entries, e)
-	return nil
-}
-
-func (s *InMemLogStore) AppendAll(es []*LogEntry) error {
-	s.entries = append(s.entries, es...)
-	return nil
-}
-
-func (s *InMemLogStore) Write(idx int, e *LogEntry) error {
-	return s.WriteAll(idx, []*LogEntry{e})
-}
-
-func (s *InMemLogStore) WriteAll(idx int, es []*LogEntry) error {
-	last := s.GetLastIndex()
-
-	if idx <= 0 || idx > last+1 {
-		return fmt.Errorf("log index out of bound")
-	}
-
-	if idx == last+1 {
-		return s.AppendAll(es)
-	}
-
-	for i := 0; i < len(es); i++ {
-		nextIdx := idx + i
-		if nextIdx <= last {
-			s.entries[nextIdx-1] = es[i]
-		} else {
-			s.Append(es[i])
+		case <-rf.quit:
+			return
 		}
 	}
-
-	return nil
 }
 
-func (s *InMemLogStore) Delete(idx int) error {
-	if idx <= 0 || idx > s.GetLastIndex() {
-		return fmt.Errorf("index out of bound")
-	}
+func (rf *Raft) runAsCandidate() {
+	voteCh := make(chan *Vote, len(rf.peers)) // give some buffer to make sure all go routines started in voteSelf will return even after runAsCandidate() returns
+	rf.incrementTerm()
+	rf.voteSelf(voteCh)
 
-	s.entries = append(s.entries[:idx-1], s.entries[idx:]...)
-	return nil
+	for {
+		select {
+		case <-rf.electionTimeoutChan():
+			rf.logln("candidate times out, start new election term")
+			rf.incrementTerm()
+			rf.voteSelf(voteCh)
+
+		case s := <-rf.stateTranCh:
+			switch s {
+			case LEADER:
+				rf.becomeLeader()
+				return
+			case FOLLOWER:
+				rf.becomeFollower()
+				return
+			}
+
+		case v := <-voteCh:
+			rf.addVote(v)
+			if rf.hasMajority() {
+				rf.logln("received votes from majority, becoming leader")
+				rf.sendStateEvent(LEADER)
+			}
+
+		case <-rf.heartbeatCh: // discover current leader
+			rf.logln(fmt.Sprintf("leader detected (server %v), becoming follower\n", rf.leaderId))
+			rf.sendStateEvent(FOLLOWER)
+
+		case <-rf.quit:
+			return
+		}
+	}
 }
 
-func (s *InMemLogStore) DeleteAll(fromIdx, toIdx int) error {
-	if fromIdx <= 0 {
-		fromIdx = 1
-	}
+func (rf *Raft) runAsLeader() {
+	heartBeat := make(chan bool)
+	stop := make(chan bool)
+	rf.sendHeartBeats() // establish leadership immediately
 
-	if toIdx > s.GetLastIndex() {
-		toIdx = s.GetLastIndex()
-	}
+	go rf.startHeartBeatTimer(heartBeat, stop)
 
-	if fromIdx > toIdx {
-		return nil
-	}
+	defer close(stop)
 
-	s.entries = append(s.entries[:fromIdx-1], s.entries[toIdx:]...)
-	return nil
+	for {
+		select {
+		case <-heartBeat:
+			go rf.sendHeartBeats()
+
+		case s := <-rf.stateTranCh:
+			switch s {
+			case FOLLOWER:
+				rf.becomeFollower()
+				return
+			}
+
+		case rep := <-rf.logRepCh:
+			rf.updateLogRep(rep)
+
+		case <-rf.quit:
+			return
+		}
+	}
 }
 
-func (s *InMemLogStore) IsMatch(idx int, e *LogEntry) bool {
-	r := s.Get(idx)
-	if r == nil {
-		return idx == 0 && e == nil
+func (rf *Raft) startFollowerElectionTimer(timeout, clearTimeout chan bool) {
+	for {
+		select {
+		// TODO does this cause too many go routines (each time.After creates a go routine) ?
+		case <-rf.electionTimeoutChan():
+			rf.logln("election times out, becoming candidate")
+			rf.stateTranCh <- CANDIDATE
+			return
+		case <-clearTimeout: // this happens when follower receives heartbeat regularly
+		}
+	}
+}
+
+func (rf *Raft) voteSelf(voteCh chan *Vote) {
+	rf.addVote(rf.newVote(rf.me))
+	rf.votedTerms[rf.term] = rf.me // reject other vote request for the same term
+
+	for i := 0; i < len(rf.peers); i++ {
+		if i != rf.me {
+			go func(id int) {
+				ok, reply := rf.requestVote(id)
+				if !ok {
+					rf.logln(fmt.Sprintf("failed to request vote from %v", id))
+				} else if rf.term < reply.Term {
+					rf.logln(fmt.Sprintf("sender is stale, candidate term=%v, peer term=%v", rf.term, reply.Term))
+					rf.updateTerm(reply.Term)
+					rf.sendStateEvent(FOLLOWER)
+				} else if reply.VoteGranted { // also indicating rf.term == reply.Term
+					rf.logln(fmt.Sprintf("vote granted %v -> %v\n", id, rf.me))
+
+					// note at this point the sender may already become leader or follower. sending vote to non-candidate
+					// may cause dead-lock if follower or leader doesn't listen voteChan
+					voteCh <- rf.newVote(id)
+				}
+			}(i)
+		}
+	}
+}
+
+// wrapper for RequestVote with retry logic
+func (rf *Raft) requestVote(id int) (bool, *RequestVoteReply) {
+	args := &RequestVoteArgs{}
+	args.Term = rf.term
+	args.CandidateId = rf.me
+
+	for j := 0; j < rf.retry; j++ {
+		var reply RequestVoteReply
+		ok := rf.peers[id].Call("Raft.RequestVote", *args, &reply)
+		if ok {
+			return true, &reply
+		}
+	}
+	return false, nil
+}
+
+func (rf *Raft) startHeartBeatTimer(heartBeat, stop chan bool) {
+	for {
+		select {
+		case <-time.After(time.Duration(rf.heartBeatPeriod) * time.Millisecond):
+			heartBeat <- true
+		case <-stop:
+			return
+		}
+	}
+}
+
+func (rf *Raft) sendHeartBeats() {
+	for i := 0; i < len(rf.peers); i++ {
+		if i != rf.me {
+			go func(id int) {
+				ok, reply := rf.sendHeartBeat(id)
+				if !ok {
+					rf.logln(fmt.Sprintf("failed to send heart beat to peer %v", id))
+				} else if !reply.Success {
+					rf.logln(fmt.Sprintf("failed to get reply for heart beat from %v", id))
+					if rf.term < reply.Term {
+						rf.updateTerm(reply.Term)
+						rf.logln("stale leader detected, becoming follower")
+						rf.sendStateEvent(FOLLOWER)
+					}
+				}
+			}(i)
+		}
+	}
+}
+
+func (rf *Raft) sendHeartBeat(peerId int) (bool, *AppendEntriesReply) {
+	args := &AppendEntriesArgs{}
+	args.Term = rf.term
+	args.LeaderId = rf.me
+
+	var reply AppendEntriesReply
+
+	if ok := rf.peers[peerId].Call("Raft.AppendEntries", *args, &reply); !ok {
+		// no need to retry as it's already a periodic job
+		return false, nil
 	} else {
-		return r.Term == e.Term
+		return true, &reply
 	}
-}
-
-func (s *InMemLogStore) GetLastIndex() int {
-	return len(s.entries)
-}
-
-func (s *InMemLogStore) Len() int {
-	return len(s.entries)
-}
-
-func (s *InMemLogStore) Get(idx int) *LogEntry {
-	if idx <= 0 || idx > s.GetLastIndex() {
-		return nil
-	}
-	return s.entries[idx-1]
-}
-
-func (s *InMemLogStore) GetAll(from, to int) []*LogEntry {
-	if from <= 0 {
-		from = 1
-	}
-
-	if to > s.GetLastIndex() {
-		to = s.GetLastIndex()
-	}
-
-	if from > to {
-		return make([]*LogEntry, 0)
-	}
-
-	return s.entries[from-1 : to]
 }
 
 // TODO put this to leader's scope
@@ -336,197 +406,9 @@ func (rf *Raft) sendAppendEntries(peerId, from, to int) (bool, *AppendEntriesRep
 	}
 }
 
-func (rf *Raft) stopAgents() {
-	for i := 0; i < len(rf.agents); i++ {
-		if i != rf.me {
-			rf.stopAgent(i)
-		}
-	}
-}
-
-func (rf *Raft) stopAgent(i int) {
-	close(rf.agents[i].stop)
-}
-
-type Vote int
-type Votes []*Vote // indexes of voted peers
-
-type State int8
-
-const (
-	FOLLOWER  = State(0)
-	CANDIDATE = State(1)
-	LEADER    = State(2)
-)
-
-func (rf *Raft) logln(s ...interface{}) {
-	header := fmt.Sprintf("server=%v, term=%v, state=%v : ", rf.me, rf.term, rf.getStateName(rf.state))
-	for _, t := range s {
-		header += fmt.Sprintf("%v ", t)
-	}
-	log.Println(header)
-}
-
-func (rf *Raft) getStateName(s State) string {
-	switch s {
-	case FOLLOWER:
-		return "FOLLOWER"
-	case CANDIDATE:
-		return "CANDIDATE"
-	default:
-		return "LEADER"
-	}
-}
-
-// a daemon to perform the state transition
-func (rf *Raft) elect() {
-	for {
-		select {
-		case newState := <-rf.stateTranChan:
-			switch newState {
-			case FOLLOWER:
-				rf.setState(FOLLOWER)
-				rf.logln("became follower")
-				go rf.runAsFollower()
-			case CANDIDATE:
-				rf.setState(CANDIDATE)
-				rf.logln("became candidate")
-				go rf.runAsCandidate()
-			case LEADER:
-				rf.setState(LEADER)
-				rf.logln("became leader")
-				go rf.runAsLeader()
-			}
-
-		case <-rf.quit:
-			rf.logln("quit elect daemon")
-			return
-		}
-	}
-}
-
-func (rf *Raft) setState(s State) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.state = s
-}
-
-func (rf *Raft) runAsFollower() {
-	timeout := make(chan bool)
-	clearTimeout := make(chan bool)
-	stop := make(chan bool)
-	defer close(stop)
-	go rf.startElectionTimer(timeout, clearTimeout, stop)
-
-	for {
-		select {
-		case <-timeout:
-			rf.logln("follower times out, becomes candidate")
-			rf.becomeCandidate()
-			return
-
-		case <-rf.heartBeatChan:
-			// receive heartBeat from leader normally. clear term timeout
-			clearTimeout <- true
-
-		case <-rf.stalenessChan: // ignore
-		case <-rf.voteChan: //vote for candidate, but candidate already becomes follower now. ignore
-		case <-rf.quit:
-			return
-		}
-	}
-}
-
-func (rf *Raft) startElectionTimer(timeout, clearTimeout, stop chan bool) {
-	for {
-		select {
-		// TODO does this cause too many go routines (each time.After creates a go routine) ?
-		case <-rf.electionTimeoutChan():
-			timeout <- true
-		case <-clearTimeout:
-		case <-stop:
-			return
-		}
-	}
-}
-
-func (rf *Raft) clearVotes() {
-	rf.votes = make([]*Vote, 0)
-}
-
-func (rf *Raft) addVote(v *Vote) {
-	rf.votes = append(rf.votes, v)
-}
-
-func (rf *Raft) runAsCandidate() {
-	defer func() {
-		rf.clearVotes()
-	}()
-
-	for {
-		rf.incrementTerm()
-		rf.voteSelf()
-
-		select {
-		case <-rf.electionTimeoutChan():
-			rf.logln("candidate times out, start new election term")
-
-		case <-rf.stalenessChan: // discover new term from peer
-			rf.logln("current candidate is stale, back to follower state")
-			rf.becomeFollower()
-			return
-
-		case v := <-rf.voteChan:
-			rf.addVote(v)
-			if rf.hasMajority() {
-				rf.logln("received votes from majority, becoming leader")
-				rf.becomeLeader()
-				return
-			}
-
-		case <-rf.heartBeatChan: // discover current leader
-			rf.logln(fmt.Sprintf("%v was elected as leader\n", rf.leaderId))
-			rf.becomeFollower()
-			return
-
-		case <-rf.quit:
-			return
-		}
-	}
-
-}
-
-func (rf *Raft) runAsLeader() {
-	heartBeat := make(chan bool)
-	stop := make(chan bool)
-	rf.sendHeartBeats() // establish leadership immediately
-
-	go rf.startHeartBeatTimer(heartBeat, stop)
-
-	defer close(stop)
-
-	for {
-		select {
-		case <-heartBeat:
-			go rf.sendHeartBeats()
-
-		case <-rf.stalenessChan:
-			rf.logln("current leader is stale, back to follower")
-			rf.becomeFollower()
-			return
-
-		case <-rf.voteChan: // vote for candidate, but candidate already becomes leader now, ignore.
-
-		case rep := <-rf.logRepCh:
-			rf.updateLogRep(rep)
-
-		case <-rf.quit:
-			return
-		}
-	}
-}
-
 func (rf *Raft) updateLogRep(r *logRep) {
+	rf.logln("start updating log entry")
+
 	if set, ok := rf.replicated[r.logIdx]; ok {
 		set.Add(r.peerId)
 		if set.Size() >= rf.majority() {
@@ -546,165 +428,6 @@ func (rf *Raft) updateLogRep(r *logRep) {
 	} else {
 		rf.logln(fmt.Sprintf("log %v has already been commited", r.logIdx))
 	}
-}
-
-func (rf *Raft) majority() int {
-	return len(rf.peers)/2 + 1
-}
-
-type IntSet struct {
-	values map[int]bool
-}
-
-func (s *IntSet) Containes(key int) bool {
-	_, ok := s.values[key]
-	return ok
-}
-
-func (s *IntSet) Add(key int) {
-	s.values[key] = true
-}
-
-func (s *IntSet) Delete(key int) {
-	delete(s.values, key)
-}
-
-func (s *IntSet) Size() int {
-	return len(s.values)
-}
-
-func (rf *Raft) startHeartBeatTimer(heartBeat, stop chan bool) {
-	for {
-		select {
-		case <-time.After(time.Duration(rf.heartBeatPeriod) * time.Millisecond):
-			heartBeat <- true
-		case <-stop:
-			return
-		}
-	}
-}
-
-func (rf *Raft) incrementTerm() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.term++
-}
-
-func (rf *Raft) updateTerm(peerCurrent int) {
-	rf.mu.Lock()
-	rf.term = peerCurrent
-	rf.mu.Unlock()
-}
-
-func (rf *Raft) sendHeartBeats() {
-	for i := 0; i < len(rf.peers); i++ {
-		if i != rf.me {
-			go func(id int) {
-				ok, reply := rf.sendHeartBeat(id)
-				if !ok {
-					rf.logln(fmt.Sprintf("failed to send heart beat to peer %v", id))
-				} else if !reply.Success {
-					rf.logln(fmt.Sprintf("failed to get reply for heart beat from %v", id))
-					if rf.term < reply.Term {
-						rf.updateTerm(reply.Term)
-						rf.stalenessChan <- true
-					}
-				}
-			}(i)
-		}
-	}
-}
-
-func (rf *Raft) sendHeartBeat(peerId int) (bool, *AppendEntriesReply) {
-	args := &AppendEntriesArgs{}
-	args.Term = rf.term
-	args.LeaderId = rf.me
-
-	var reply AppendEntriesReply
-
-	if ok := rf.peers[peerId].Call("Raft.AppendEntries", *args, &reply); !ok {
-		// no need to retry as it's already a periodic job
-		return false, nil
-	} else {
-		return true, &reply
-	}
-}
-
-func (rf *Raft) voteSelf() {
-	rf.addVote(rf.newVote(rf.me))
-	rf.votedTerms[rf.term] = rf.me // reject other vote request for the same term
-
-	for i := 0; i < len(rf.peers); i++ {
-		if i != rf.me {
-			go func(id int) {
-				ok, reply := rf.requestVote(id)
-				if !ok {
-					rf.logln(fmt.Sprintf("failed to request vote from %v", id))
-				} else if rf.term < reply.Term {
-					rf.logln(fmt.Sprintf("sender is stale, candidate term=%v, peer term=%v", rf.term, reply.Term))
-					rf.updateTerm(reply.Term)
-					rf.stalenessChan <- true
-				} else if reply.VoteGranted { // also indicating rf.term == reply.Term
-					rf.logln(fmt.Sprintf("vote granted %v -> %v\n", id, rf.me))
-
-					// note at this point the sender may already become leader or follower. sending vote to non-candidate
-					// may cause dead-lock if follower or leader doesn't listen voteChan
-					rf.voteChan <- rf.newVote(id)
-				}
-			}(i)
-		}
-	}
-}
-
-// wrapper for RequestVote with retry logic
-func (rf *Raft) requestVote(id int) (bool, *RequestVoteReply) {
-	args := &RequestVoteArgs{}
-	args.Term = rf.term
-	args.CandidateId = rf.me
-
-	for j := 0; j < rf.retry; j++ {
-		var reply RequestVoteReply
-		ok := rf.peers[id].Call("Raft.RequestVote", *args, &reply)
-		if ok {
-			return true, &reply
-		}
-	}
-	return false, nil
-}
-
-func (rf *Raft) newVote(id int) *Vote {
-	v := Vote(id)
-	return &v
-}
-
-func (rf *Raft) retryF(f func() bool, cnt int) {
-	for i := 0; i < cnt; i++ {
-		if f() {
-			break
-		}
-	}
-}
-
-// check if a candidate already owns votes from majority
-func (rf *Raft) hasMajority() bool {
-	return len(rf.votes) > len(rf.peers)/2
-}
-
-func (rf *Raft) becomeFollower() {
-	rf.stateTranChan <- FOLLOWER
-}
-
-func (rf *Raft) becomeCandidate() {
-	rf.stateTranChan <- CANDIDATE
-}
-
-func (rf *Raft) becomeLeader() {
-	rf.stateTranChan <- LEADER
-}
-
-func (rf *Raft) electionTimeoutChan() <-chan time.Time {
-	t := rand.Int()%(rf.electionTimeoutHigh-rf.electionTimeoutLow) + rf.electionTimeoutLow
-	return time.After(time.Duration(t) * time.Millisecond)
 }
 
 // return currentTerm and whether this server
@@ -763,6 +486,7 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
+
 	// it is important to clear stale terms that won't be used to release mem
 	for _, t := range rf.votedTerms {
 		if t < rf.term {
@@ -778,8 +502,9 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 
 	// vote for candidate whose term >= rf.term, and update rf.term to candidate's term
 	if args.Term > rf.term {
+		rf.logln("stale server detected, go back to follower. peer term = ", args.Term)
 		rf.updateTerm(args.Term)
-		rf.stalenessChan <- true // if self is candidate, go back to follower
+		rf.stateTranCh <- FOLLOWER // if self is candidate, go back to follower
 	}
 
 	if _, ok := rf.votedTerms[args.Term]; ok { // already voted for other candidate
@@ -806,24 +531,25 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
-// follower's behavior as the receiver of AppendEntries call, as described in Figure 2 in the original paper
+// all servers might receive this RPC call
 func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
-	if rf.isSenderStale(args.Term) {
+	if args.Term < rf.term {
 		reply.Term = rf.term
 		reply.Success = false
 		return
 	}
 
-	if rf.isStale(args.Term) {
+	if args.Term > rf.term {
+		rf.logln("stale term detected, go back to follower. peer term = ", args.Term)
 		rf.updateTerm(args.Term)
-		rf.stalenessChan <- true
+		rf.stateTranCh <- FOLLOWER
 	}
-	reply.Term = rf.term
 
+	reply.Term = rf.term
 	if rf.isHeartBeat(&args) {
 		reply.Success = true
 		rf.leaderId = args.LeaderId
-		rf.heartBeatChan <- true
+		rf.heartbeatCh <- true
 		return
 	}
 
@@ -847,31 +573,12 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 
 	// update commit index
 	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = rf.min(args.LeaderCommit, rf.log.GetLastIndex())
+		rf.commitIndex = Min(args.LeaderCommit, rf.log.GetLastIndex())
 	}
 
 	// start to apply to local state machine
 	if rf.lastApplied < rf.commitIndex {
 		rf.sendApplyEvent()
-	}
-}
-
-func (rf *Raft) isStale(senderTerm int) bool {
-	return rf.term < senderTerm
-}
-
-func (rf *Raft) isSenderStale(senderTerm int) bool {
-	return senderTerm < rf.term
-}
-
-func (rf *Raft) isHeartBeat(args *AppendEntriesArgs) bool {
-	return len(args.Entries) == 0
-}
-
-func (rf *Raft) sendApplyEvent() {
-	select {
-	case rf.applyEventCh <- true: // channel must have non-zero buffer
-	default:
 	}
 }
 
@@ -895,8 +602,123 @@ func (rf *Raft) apply() {
 	}
 }
 
+func (rf *Raft) stopAgents() {
+	for i := 0; i < len(rf.agents); i++ {
+		if i != rf.me {
+			rf.stopAgent(i)
+		}
+	}
+}
+
+func (rf *Raft) stopAgent(i int) {
+	close(rf.agents[i].stop)
+}
+
+func (rf *Raft) isHeartBeat(args *AppendEntriesArgs) bool {
+	return len(args.Entries) == 0
+}
+
+func (rf *Raft) sendApplyEvent() {
+	select {
+	case rf.applyEventCh <- true: // channel must have non-zero buffer
+	default:
+	}
+}
+
 func (rf *Raft) stopApply() {
 	close(rf.applyEventCh)
+}
+
+// check if a candidate already owns votes from majority
+func (rf *Raft) hasMajority() bool {
+	return len(rf.votes) > len(rf.peers)/2
+}
+
+func (rf *Raft) becomeFollower() {
+	rf.setState(FOLLOWER)
+	go rf.runAsFollower()
+	rf.logln("became follower")
+}
+
+func (rf *Raft) becomeCandidate() {
+	rf.setState(CANDIDATE)
+	go rf.runAsCandidate()
+	rf.logln("became candidate")
+}
+
+func (rf *Raft) becomeLeader() {
+	rf.setState(LEADER)
+	go rf.runAsLeader()
+	rf.logln("became leader")
+}
+
+func (rf *Raft) electionTimeoutChan() <-chan time.Time {
+	t := rand.Int()%(rf.electionTimeoutHigh-rf.electionTimeoutLow) + rf.electionTimeoutLow
+	return time.After(time.Duration(t) * time.Millisecond)
+}
+
+func (rf *Raft) newVote(id int) *Vote {
+	v := Vote(id)
+	return &v
+}
+
+func (rf *Raft) retryF(f func() bool, cnt int) {
+	for i := 0; i < cnt; i++ {
+		if f() {
+			break
+		}
+	}
+}
+
+func (rf *Raft) incrementTerm() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.term++
+}
+
+func (rf *Raft) updateTerm(peerCurrent int) {
+	rf.mu.Lock()
+	rf.term = peerCurrent
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) majority() int {
+	return len(rf.peers)/2 + 1
+}
+
+func (rf *Raft) logln(s ...interface{}) {
+	header := fmt.Sprintf("server=%v, term=%v, state=%v : ", rf.me, rf.term, rf.getStateName(rf.state))
+	for _, t := range s {
+		header += fmt.Sprintf("%v ", t)
+	}
+	log.Println(header)
+}
+
+func (rf *Raft) getStateName(s State) string {
+	switch s {
+	case FOLLOWER:
+		return "FOLLOWER"
+	case CANDIDATE:
+		return "CANDIDATE"
+	default:
+		return "LEADER"
+	}
+}
+
+func (rf *Raft) setState(s State) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.state = s
+}
+
+func (rf *Raft) addVote(v *Vote) {
+	rf.votes = append(rf.votes, v)
+}
+
+func (rf *Raft) sendStateEvent(s State) {
+	go func() {
+		rf.stateTranCh <- s
+	}()
 }
 
 //
@@ -954,8 +776,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 }
 
 func (rf *Raft) replicateEntry(idx int) {
-	for _, agent := range rf.agents {
-		agent.entryChan <- idx
+	for i, agent := range rf.agents {
+		if i != rf.me {
+			agent.entryChan <- idx
+		}
 	}
 }
 
@@ -979,22 +803,6 @@ func (rf *Raft) Kill() {
 	rf.stopAgents()
 	rf.stopApply()
 	close(rf.quit)
-}
-
-func (rf *Raft) min(a, b int) int {
-	if a < b {
-		return a
-	} else {
-		return b
-	}
-}
-
-func (rf *Raft) max(a, b int) int {
-	if a < b {
-		return b
-	} else {
-		return a
-	}
 }
 
 //
@@ -1023,20 +831,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.term = 0
 	rf.leaderId = -1
 	rf.retry = 3
-	rf.votedTerms = make(map[int]int)
-	rf.heartBeatChan = make(chan bool)
-	rf.leaderElectedChan = make(chan bool)
-	rf.stalenessChan = make(chan bool)
-	rf.stateTranChan = make(chan State)
-	rf.voteChan = make(chan *Vote)
 	rf.applyEventCh = make(chan bool, 1)
 	rf.log = NewInMemLogStore()
 	rf.agents = make([]*Agent, len(peers))
 	rf.replicated = make(map[int]*IntSet)
 	rf.quit = make(chan bool)
+	rf.logRepCh = make(chan *logRep)
+	rf.stateTranCh = make(chan State)
+	rf.heartbeatCh = make(chan bool)
+	rf.votedTerms = make(map[int]int)
 
-	go rf.elect()
-	rf.stateTranChan <- FOLLOWER
+	rf.becomeFollower()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
