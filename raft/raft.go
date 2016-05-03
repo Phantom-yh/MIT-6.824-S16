@@ -332,6 +332,7 @@ func (rf *Raft) startAgent(i int) {
 	agent := rf.agents[i]
 
 	replicate := func(idx int) {
+		rf.logln("leader's last log index = ", rf.log.GetLastIndex())
 		rf.logln(fmt.Sprintf("replicating log entry %v to server %v", agent.nextIndex, i))
 		go rf.replicate(i, idx)
 	}
@@ -354,7 +355,9 @@ func (rf *Raft) startAgent(i int) {
 
 		case firstFailure := <-agent.failureChan:
 			rf.logln(fmt.Sprintf("log after %v failed to replicate on machine %v", firstFailure, i))
-			agent.nextIndex--
+			if agent.nextIndex > 1 {
+				agent.nextIndex--
+			}
 			replicate(agent.nextIndex)
 
 		case <-agent.stop:
@@ -554,6 +557,8 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 
 	reply.Term = rf.term
 	if rf.isHeartBeat(&args) {
+		// rf.showStatus()
+
 		reply.Success = true
 		rf.leaderId = args.LeaderId
 		rf.heartbeatCh <- true
@@ -584,6 +589,10 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 	reply.Success = err == nil
 
 	rf.updateAndApply(&args)
+}
+
+func (rf *Raft) showStatus() {
+	rf.logln("lastApplied =", rf.lastApplied, "commitIndex =", rf.commitIndex)
 }
 
 func (rf *Raft) updateAndApply(args *AppendEntriesArgs) {
