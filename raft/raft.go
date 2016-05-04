@@ -245,9 +245,7 @@ func (rf *Raft) voteSelf(voteCh chan *Vote) {
 
 // wrapper for RequestVote with retry logic
 func (rf *Raft) requestVote(id int) (bool, *RequestVoteReply) {
-	args := &RequestVoteArgs{}
-	args.Term = rf.term
-	args.CandidateId = rf.me
+	args := rf.makeVote()
 
 	for j := 0; j < rf.retry; j++ {
 		var reply RequestVoteReply
@@ -257,6 +255,17 @@ func (rf *Raft) requestVote(id int) (bool, *RequestVoteReply) {
 		}
 	}
 	return false, nil
+}
+
+func (rf *Raft) makeVote() *RequestVoteArgs {
+	lastIdx, lastEntry := rf.getLastEntry()
+
+	return &RequestVoteArgs{
+		Term:         rf.term,
+		CandidateId:  rf.me,
+		LastLogIndex: lastIdx,
+		LastLogTerm:  lastEntry.Term,
+	}
 }
 
 func (rf *Raft) startHeartBeatTimer(heartBeat, stop chan bool) {
@@ -517,6 +526,13 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 		rf.stateTranCh <- FOLLOWER // if self is candidate, go back to follower
 	}
 
+	// section 5.4, make sure candidate id is update-to-date as receiver's log, otherwise reject it
+	if !rf.isUpToDate(&args) {
+		reply.Term = rf.term
+		reply.VoteGranted = false
+		return
+	}
+
 	if _, ok := rf.votedTerms[args.Term]; ok { // already voted for other candidate
 		reply.Term = rf.term
 		reply.VoteGranted = false
@@ -525,6 +541,28 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.term
 		reply.VoteGranted = true
 	}
+}
+
+func (rf *Raft) isUpToDate(args *RequestVoteArgs) bool {
+	lastIdx, lastEntry := rf.getLastEntry()
+	if args.LastLogTerm > lastEntry.Term {
+		return true
+	} else if args.LastLogTerm < lastEntry.Term {
+		return false
+	} else {
+		return args.LastLogIndex >= lastIdx
+	}
+}
+
+func (rf *Raft) getLastEntry() (int, *LogEntry) {
+	idx := rf.log.GetLastIndex()
+	entry := rf.log.Get(idx)
+	if entry == nil {
+		entry = &LogEntry{
+			Term: 0,
+		}
+	}
+	return idx, entry
 }
 
 type AppendEntriesArgs struct {
