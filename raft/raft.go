@@ -93,6 +93,12 @@ const (
 	FOLLOWER  = State(0)
 	CANDIDATE = State(1)
 	LEADER    = State(2)
+
+	// TODO put all configurable parameters here
+	AGENT_ENTRY_BUFFER_SIZE = 100
+	LOG_REP_RETRY_MS = 1000  // sleep time before retry a failed log replication RPC
+
+	DEBUG = true
 )
 
 // a log has been successfully replicated
@@ -317,7 +323,18 @@ func (rf *Raft) makeHeartbeat() *AppendEntriesArgs {
 	args.Term = rf.term
 	args.LeaderId = rf.me
 	args.LeaderCommit = rf.commitIndex
+	args.PrevLogIndex = rf.log.GetLastIndex()
+	args.PrevLogTerm = rf.getPrevLogTerm()
 	return args
+}
+
+func (rf *Raft) getPrevLogTerm() int {
+	lastEntry := rf.log.Get(rf.log.GetLastIndex())
+	if lastEntry == nil {
+		return 0
+	} else {
+		return lastEntry.Term
+	}
 }
 
 // TODO put this to leader's scope
@@ -327,7 +344,7 @@ func (rf *Raft) startAgents() {
 			rf.agents[i] = &Agent{
 				nextIndex:   rf.log.GetLastIndex() + 1,
 				matchIndex:  0,
-				entryChan:   make(chan int),
+				entryChan:   make(chan int, AGENT_ENTRY_BUFFER_SIZE),
 				successChan: make(chan int, 1),
 				failureChan: make(chan int, 1),
 				stop:        make(chan bool),
@@ -337,22 +354,23 @@ func (rf *Raft) startAgents() {
 	}
 }
 
+// TODO this method should belong to struct Agent not Raft
 func (rf *Raft) startAgent(i int) {
 	agent := rf.agents[i]
-
 	replicate := func(idx int) {
-		rf.logln("leader's last log index = ", rf.log.GetLastIndex())
-		rf.logln(fmt.Sprintf("replicating log entry %v to server %v", agent.nextIndex, i))
+		rf.logln("leader's last log index = ", rf.log.GetLastIndex(),
+			fmt.Sprintf("replicating log entry %v to server %v", agent.nextIndex, i))
 		go rf.replicate(i, idx)
 	}
 
 	for {
 		select {
 		case idx := <-agent.entryChan:
+		 	rf.logln(fmt.Sprintf("received entry %v, start to replicate on all followers", idx))
 			replicate(idx)
 
 		case lastSuccess := <-agent.successChan:
-			rf.logln(fmt.Sprintf("logs pre to %v have been succesfully replicated on server %v", lastSuccess, i))
+			rf.logln(fmt.Sprintf("logs pre to %v have been successfully replicated on server %v", lastSuccess, i))
 			agent.nextIndex = lastSuccess + 1
 			agent.matchIndex = lastSuccess
 			rf.logRepCh <- &logRep{i, agent.matchIndex}
@@ -378,6 +396,8 @@ func (rf *Raft) startAgent(i int) {
 
 // TODO can be optimized to send multiple entries each RPC call
 func (rf *Raft) replicate(agentId, logIdx int) {
+	rf.logln(fmt.Sprintf("replicating log %v from leader to follower %v : ", logIdx, agentId))
+
 	set := NewIntSet()
 	set.Add(rf.me)
 	rf.replicated[logIdx] = set
@@ -389,12 +409,18 @@ func (rf *Raft) replicate(agentId, logIdx int) {
 				// current server may no longer be leader. the channel should be buffered to prevent deadlock
 				rf.agents[agentId].successChan <- logIdx
 			} else {
-				rf.agents[agentId].failureChan <- logIdx
+				if reply.Term > rf.term {
+					rf.logln("stale term detected, becoming follower")
+					rf.updateTerm(reply.Term)
+					rf.sendStateEvent(FOLLOWER)
+				} else {
+					rf.agents[agentId].failureChan <- logIdx
+				}
 			}
 			break
 		} else {
-			rf.logln(fmt.Sprintf("failed to make AppendEntries call to server %v, retrying", agentId))
-			// TODO may sleep for some time before retrying
+			rf.logln(fmt.Sprintf("failed to make AppendEntries call to server %v, retrying in %v ms", agentId, LOG_REP_RETRY_MS))
+			time.Sleep(time.Duration(LOG_REP_RETRY_MS) * time.Millisecond)
 		}
 	}
 }
@@ -426,8 +452,6 @@ func (rf *Raft) sendAppendEntries(peerId, from, to int) (bool, *AppendEntriesRep
 }
 
 func (rf *Raft) updateLogRep(r *logRep) {
-	rf.logln(fmt.Sprintf("updating log entry : peer = %v, log index = %v", r.peerId, r.logIdx))
-
 	if set, ok := rf.replicated[r.logIdx]; ok {
 		set.Add(r.peerId)
 		if set.Size() >= rf.majority() {
@@ -526,8 +550,9 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 		rf.stateTranCh <- FOLLOWER // if self is candidate, go back to follower
 	}
 
-	// section 5.4, make sure candidate id is update-to-date as receiver's log, otherwise reject it
+	// section 5.4, make sure candidate id is up-to-date as receiver's log, otherwise reject it
 	if !rf.isUpToDate(&args) {
+		rf.logln("candidate is not up to date")
 		reply.Term = rf.term
 		reply.VoteGranted = false
 		return
@@ -582,29 +607,19 @@ type AppendEntriesReply struct {
 // all servers might receive this RPC call
 func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
 	if args.Term < rf.term {
+		rf.logln(fmt.Sprintf("stale sender detected, ignore append entries request. sender term = %v", args.Term))
 		reply.Term = rf.term
 		reply.Success = false
 		return
 	}
 
 	if args.Term > rf.term {
-		rf.logln("stale term detected, go back to follower. peer term = ", args.Term)
+		rf.logln("stale receiver detected, go back to follower. sender term = ", args.Term)
 		rf.updateTerm(args.Term)
 		rf.stateTranCh <- FOLLOWER
 	}
 
 	reply.Term = rf.term
-	if rf.isHeartBeat(&args) {
-		// rf.showStatus()
-
-		reply.Success = true
-		rf.leaderId = args.LeaderId
-		rf.heartbeatCh <- true
-		rf.updateAndApply(&args) // heartbeat can also be used to update and apply uncommitted entries on followers
-		return
-	}
-
-	rf.logln(fmt.Sprintf("start to append %v entries", len(args.Entries)))
 
 	// consistency check before appending entries
 	e := &LogEntry{Term: args.PrevLogTerm}
@@ -621,6 +636,18 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 		rf.logln("failed for consisency check, prev log index = ", args.PrevLogIndex, "prev log term = ", args.PrevLogTerm)
 		return
 	}
+
+	if rf.isHeartBeat(&args) {
+		// rf.showStatus()
+
+		reply.Success = true
+		rf.leaderId = args.LeaderId
+		rf.heartbeatCh <- true
+		rf.updateAndApply(&args) // heartbeat can also be used to update and apply uncommitted entries on followers
+		return
+	}
+
+	rf.logln(fmt.Sprintf("start to append %v entries", len(args.Entries)))
 
 	// write new entries
 	err := rf.log.WriteAll(args.PrevLogIndex+1, args.Entries)
@@ -751,11 +778,13 @@ func (rf *Raft) majority() int {
 }
 
 func (rf *Raft) logln(s ...interface{}) {
-	header := fmt.Sprintf("server=%v, term=%v, state=%v : ", rf.me, rf.term, rf.getStateName(rf.state))
-	for _, t := range s {
-		header += fmt.Sprintf("%v ", t)
+	if DEBUG {
+		header := fmt.Sprintf("server=%v, term=%v, state=%v : ", rf.me, rf.term, rf.getStateName(rf.state))
+		for _, t := range s {
+			header += fmt.Sprintf("%v ", t)
+		}
+		log.Println(header)
 	}
-	log.Println(header)
 }
 
 func (rf *Raft) getStateName(s State) string {
