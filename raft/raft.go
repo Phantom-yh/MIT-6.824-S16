@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"bytes"
+	"encoding/gob"
 	"fmt"
 	"labrpc"
 	"log"
@@ -221,7 +223,7 @@ func (rf *Raft) startFollowerElectionTimer(timeout, clearTimeout chan bool) {
 
 func (rf *Raft) voteSelf(voteCh chan *Vote) {
 	rf.addVote(rf.newVote(rf.me))
-	rf.votedFor = rf.me // reject other vote request for the same term
+	rf.updateVotedFor(rf.me) // reject other vote request for the same term
 
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
@@ -443,32 +445,60 @@ func (rf *Raft) GetState() (int, bool) {
 	return rf.term, rf.state == LEADER
 }
 
+// TODO add snapshot support
+type PersistentState struct {
+	Term     int
+	VotedFor int
+	Log      []*LogEntry
+}
+
 //
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
-	// Your code here.
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := gob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	var state bytes.Buffer
+	enc := gob.NewEncoder(&state)
+
+	s := &PersistentState{
+		Term:     rf.term,
+		VotedFor: rf.votedFor,
+		Log:      rf.log.GetAll(1, rf.log.GetLastIndex()),
+	}
+	err := enc.Encode(s)
+	if err != nil {
+		log.Fatalln(err)
+		return
+	}
+
+	data := state.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
 // restore previously persisted state.
 //
 func (rf *Raft) readPersist(data []byte) {
-	// Your code here.
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := gob.NewDecoder(r)
-	// d.Decode(&rf.xxx)
-	// d.Decode(&rf.yyy)
+	if data == nil || len(data) == 0 {
+		return // already initialized in Make()
+	}
+
+	state := bytes.NewBuffer(data)
+	dec := gob.NewDecoder(state)
+
+	var s PersistentState
+	err := dec.Decode(&s)
+	if err != nil {
+		log.Fatalln(err)
+		return
+	}
+
+	rf.term = s.Term
+	rf.votedFor = s.VotedFor
+	logStore := NewInMemLogStore()
+	logStore.AppendAll(s.Log)
+	rf.log = logStore
 }
 
 //
@@ -493,6 +523,8 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 //
 func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
+	defer rf.persist()
+
 	if args.Term < rf.term {
 		reply.Term = rf.term
 		reply.VoteGranted = false
@@ -518,7 +550,7 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.term
 		reply.VoteGranted = false
 	} else {
-		rf.votedFor = args.CandidateId
+		rf.updateVotedFor(args.CandidateId)
 		reply.Term = rf.term
 		reply.VoteGranted = true
 	}
@@ -551,6 +583,8 @@ type AppendEntriesReply struct {
 
 // all servers might receive this RPC call
 func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) {
+	defer rf.persist()
+
 	if args.Term < rf.term {
 		rf.logln(fmt.Sprintf("stale sender detected, ignore append entries request. sender term = %v", args.Term))
 		reply.Term = rf.term
@@ -621,11 +655,10 @@ func (rf *Raft) apply() {
 		for rf.lastApplied < rf.commitIndex {
 			rf.lastApplied++
 			entry := rf.log.Get(rf.lastApplied)
-			msg := &ApplyMsg{
+			rf.applyCh <- ApplyMsg{
 				Index:   rf.lastApplied,
 				Command: entry.Command,
 			}
-			rf.applyCh <- *msg
 			rf.logln(fmt.Sprintf("applied log %v to local state machine", rf.lastApplied))
 		}
 
@@ -705,17 +738,24 @@ func (rf *Raft) retryF(f func() bool, cnt int) {
 }
 
 func (rf *Raft) incrementTerm() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.term++
-	rf.votedFor = -1
+	rf.updateTerm(rf.term + 1)
 }
 
 func (rf *Raft) updateTerm(peerCurrent int) {
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	rf.term = peerCurrent
 	rf.votedFor = -1
-	rf.mu.Unlock()
+
+	rf.persist()
+}
+
+func (rf *Raft) updateVotedFor(votedFor int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.votedFor = votedFor
+
+	rf.persist()
 }
 
 func (rf *Raft) majority() int {
@@ -861,6 +901,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		entry := rf.makeEntry(command)
 		rf.ml.Lock()
 		rf.log.Append(entry)
+		rf.persist()
 		idx := rf.log.GetLastIndex()
 		rf.ml.Unlock()
 
@@ -909,6 +950,7 @@ func (rf *Raft) Kill() {
 //
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
+
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
@@ -930,16 +972,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.stateTranCh = make(chan State)
 	rf.heartbeatCh = make(chan bool)
 	rf.votedFor = -1
-
-	rf.becomeFollower()
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	rf.commitIndex = 0
-	rf.lastApplied = 0
-	// must start agent after read from persist store, because nextIndex is initialized to last log index + 1
-	go rf.startAgents()
+	rf.becomeFollower()
 	go rf.apply()
 
 	return rf
