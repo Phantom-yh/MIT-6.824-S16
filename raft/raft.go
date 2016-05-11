@@ -107,16 +107,6 @@ type logRep struct {
 	logIdx int
 }
 
-// Agent is what a leader uses to communicate with followers
-type Agent struct {
-	nextIndex   int
-	matchIndex  int
-	entryChan   chan int // new entry to replicate, if it is greater than nextIndex then postpone it until log[nextIndex] is replicated
-	successChan chan int // index of last successfully-replicated entry
-	failureChan chan int
-	stop        chan bool
-}
-
 func (rf *Raft) runAsFollower() {
 	timeout := make(chan bool)
 	clearTimeout := make(chan bool)
@@ -186,8 +176,12 @@ func (rf *Raft) runAsLeader() {
 	rf.sendHeartBeats() // establish leadership immediately
 
 	go rf.startHeartBeatTimer(heartBeat, stop)
+	go rf.startAgents()
 
-	defer close(stop)
+	defer func () {
+		close(stop)
+		rf.stopAgents()
+	}()
 
 	for {
 		select {
@@ -337,6 +331,17 @@ func (rf *Raft) getPrevLogTerm() int {
 	}
 }
 
+// Agent is what a leader uses to communicate with followers
+type Agent struct {
+	nextIndex   int
+	matchIndex  int
+	entryChan   chan int // new entry to replicate, if it is greater than nextIndex then postpone it until log[nextIndex] is replicated
+	successChan chan int // index of last successfully-replicated entry
+	failureChan chan int
+	stop        chan bool
+	stopped bool
+}
+
 // TODO put this to leader's scope
 func (rf *Raft) startAgents() {
 	for i := 0; i < len(rf.agents); i++ {
@@ -348,6 +353,7 @@ func (rf *Raft) startAgents() {
 				successChan: make(chan int, 1),
 				failureChan: make(chan int, 1),
 				stop:        make(chan bool),
+				stopped: false,
 			}
 			go rf.startAgent(i)
 		}
@@ -358,15 +364,15 @@ func (rf *Raft) startAgents() {
 func (rf *Raft) startAgent(i int) {
 	agent := rf.agents[i]
 	replicate := func(idx int) {
-		rf.logln("leader's last log index = ", rf.log.GetLastIndex(),
-			fmt.Sprintf("replicating log entry %v to server %v", agent.nextIndex, i))
-		go rf.replicate(i, idx)
+		if idx == agent.nextIndex { // otherwise postpone it until log[nextIndex] has been replicated (received from successChan)
+			go rf.replicate(i, idx)
+		}
 	}
 
 	for {
 		select {
 		case idx := <-agent.entryChan:
-		 	rf.logln(fmt.Sprintf("received entry %v, start to replicate on all followers", idx))
+		 	rf.logln(fmt.Sprintf("received entry %v, wait for replicating on follower %v", idx, i))
 			replicate(idx)
 
 		case lastSuccess := <-agent.successChan:
@@ -389,6 +395,7 @@ func (rf *Raft) startAgent(i int) {
 
 		case <-agent.stop:
 			rf.logln("stop agent ", i)
+			agent.stopped = true
 			return
 		}
 	}
@@ -402,7 +409,7 @@ func (rf *Raft) replicate(agentId, logIdx int) {
 	set.Add(rf.me)
 	rf.replicated[logIdx] = set
 
-	for {
+	for !rf.agents[agentId].stopped {
 		ok, reply := rf.sendAppendEntries(agentId, logIdx, logIdx)
 		if ok {
 			if reply.Success {
@@ -424,6 +431,7 @@ func (rf *Raft) replicate(agentId, logIdx int) {
 		}
 	}
 }
+
 
 // replicate log entries [from, to] to peer[peerId] at the same RPC call
 func (rf *Raft) sendAppendEntries(peerId, from, to int) (bool, *AppendEntriesReply) {
@@ -552,7 +560,7 @@ func (rf *Raft) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) {
 
 	// section 5.4, make sure candidate id is up-to-date as receiver's log, otherwise reject it
 	if !rf.isUpToDate(&args) {
-		rf.logln("candidate is not up to date")
+		rf.logln("candidate is not up to date, rejecting vote request")
 		reply.Term = rf.term
 		reply.VoteGranted = false
 		return
@@ -627,27 +635,33 @@ func (rf *Raft) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply)
 		e = nil
 	}
 
-	if !rf.log.IsMatch(args.PrevLogIndex, e) {
-		reply.Success = false
-
-		// delete conflicting entry and all entries after it (as described in the original paper)
-		rf.log.DeleteAll(args.PrevLogIndex, rf.log.GetLastIndex())
-
-		rf.logln("failed for consisency check, prev log index = ", args.PrevLogIndex, "prev log term = ", args.PrevLogTerm)
-		return
-	}
-
 	if rf.isHeartBeat(&args) {
 		// rf.showStatus()
 
 		reply.Success = true
 		rf.leaderId = args.LeaderId
 		rf.heartbeatCh <- true
-		rf.updateAndApply(&args) // heartbeat can also be used to update and apply uncommitted entries on followers
+
+		// heartbeat can also be used to update and apply uncommitted entries on followers
+		if !rf.log.IsMatch(args.PrevLogIndex, e) {
+			rf.log.DeleteAll(args.PrevLogIndex, rf.log.GetLastIndex())
+		} else {
+			rf.updateAndApply(&args)
+		}
 		return
 	}
 
 	rf.logln(fmt.Sprintf("start to append %v entries", len(args.Entries)))
+
+	if !rf.log.IsMatch(args.PrevLogIndex, e) {
+		reply.Success = false
+
+		// delete conflicting entry and all entries after it (as described in the original paper)
+		rf.log.DeleteAll(args.PrevLogIndex, rf.log.GetLastIndex())
+
+		rf.logln("failed for consistency check, prev log index = ", args.PrevLogIndex, "prev log term = ", args.PrevLogTerm)
+		return
+	}
 
 	// write new entries
 	err := rf.log.WriteAll(args.PrevLogIndex+1, args.Entries)
@@ -859,6 +873,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		idx := rf.log.GetLastIndex()
 		rf.ml.Unlock()
 
+		rf.logln(fmt.Sprintf("applying log entry index = %v, command = %v", idx, command))
 		// replicate to followers, return immediately
 		rf.replicateEntry(idx)
 
@@ -893,7 +908,7 @@ func (rf *Raft) Kill() {
 	// Your code here, if desired.
 
 	// quit all go routine
-	rf.stopAgents()
+	//rf.stopAgents()
 	rf.stopApply()
 	close(rf.quit)
 }

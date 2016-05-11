@@ -310,7 +310,7 @@ func TestRejoin(t *testing.T) {
 
 	// old leader connected again
 	cfg.connect(leader1)
-	
+
 	cfg.one(104, 2)
 
 	// all together now
